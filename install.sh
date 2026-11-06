@@ -26,9 +26,12 @@ Config_Variable() {
     confdir="/etc/ocserv"
 
     # Obtain the network card interface name
-    systemctl start NetworkManager.service
-    ethlist=$(nmcli --nocheck d | grep -v -E "(^(DEVICE|lo)|unavailable|^[^e])" | awk '{print $1}')
-    eth=$(printf "${ethlist}\n" | head -n 1)
+    ethlist=$(ip -o link show | awk -F': ' '{print $2}' | cut -d'@' -f1 | grep -v -E '^(lo|docker|veth|br-|vpns|tun)')
+    # Prefer the interface that holds the default route
+    eth=$(ip route show default 2>/dev/null | awk '/default/ {for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | head -n 1)
+    if [[ -z "${eth}" ]]; then
+        eth=$(printf "${ethlist}\n" | head -n 1)
+    fi
     if [[ $(printf "${ethlist}\n" | wc -l) -gt 1 ]]; then
         echo ======================================
         echo "Network Interface list:"
@@ -156,9 +159,13 @@ _EOF_
         --template server.tmpl --outfile ${servercert}
     fi
 
-    # Copy the certificate
-    cp "${servercert}" /etc/pki/ocserv/public/server.crt
-    cp "${serverkey}" /etc/pki/ocserv/private/server.key
+    # Copy the certificate and point ocserv.conf at it
+    mkdir -p "${confdir}/ssl"
+    cp "${servercert}" "${confdir}/ssl/server-cert.pem"
+    cp "${serverkey}" "${confdir}/ssl/server-key.pem"
+    chmod 600 "${confdir}/ssl/server-key.pem"
+    sed -i "s@^server-cert = .*@server-cert = ${confdir}/ssl/server-cert.pem@" "${confdir}/ocserv.conf"
+    sed -i "s@^server-key = .*@server-key = ${confdir}/ssl/server-key.pem@" "${confdir}/ocserv.conf"
 
     # Edit the configuration file
     (echo "${password}"; sleep 1; echo "${password}") | ocpasswd -c "${confdir}/ocpasswd" ${username}
@@ -181,39 +188,55 @@ _EOF_
 }
 
 Config_Firewall() {
-    firewalldisactive=$(systemctl is-active firewalld.service)
-    iptablesisactive=$(systemctl is-active iptables.service)
+    firewalldisactive=$(systemctl is-active firewalld.service 2>/dev/null)
 
-    # Add a firewall permission list
     if [[ ${firewalldisactive} = 'active' ]]; then
-        echo "Adding firewall ports."
+        echo "Adding firewall ports (firewalld)."
         firewall-cmd --permanent --add-port=${port}/tcp
         firewall-cmd --permanent --add-port=${port}/udp
-        echo "Allow firewall to forward."
+        firewall-cmd --permanent --add-port=80/tcp
         firewall-cmd --permanent --add-masquerade
-        echo "Reload firewall configure."
         firewall-cmd --reload
-    elif [[ ${iptablesisactive} = 'active' ]]; then
-        iptables -I INPUT -p tcp --dport ${port} -j ACCEPT
-        iptables -I INPUT -p udp --dport ${port} -j ACCEPT
-        iptables -I FORWARD -s ${vpnnetwork} -j ACCEPT
-        iptables -I FORWARD -d ${vpnnetwork} -j ACCEPT
+        return
+    fi
+
+    if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then
+        echo "Adding firewall ports (ufw)."
+        ufw allow ${port}/tcp
+        ufw allow ${port}/udp
+        ufw allow 80/tcp
+        sed -i 's/^DEFAULT_FORWARD_POLICY=.*/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw
+        if ! grep -q "OCSERV_NAT" /etc/ufw/before.rules; then
+            sed -i "1i # OCSERV_NAT\\n*nat\\n:POSTROUTING ACCEPT [0:0]\\n-A POSTROUTING -s ${vpnnetwork} -o ${eth} -j MASQUERADE\\nCOMMIT\\n# OCSERV_NAT_END\\n" /etc/ufw/before.rules
+        fi
+        ufw reload
+        return
+    fi
+
+    # Plain iptables (default on most Ubuntu/Debian servers)
+    echo "Configuring iptables NAT."
+    iptables -C INPUT -p tcp --dport ${port} -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport ${port} -j ACCEPT
+    iptables -C INPUT -p udp --dport ${port} -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport ${port} -j ACCEPT
+    iptables -C FORWARD -s ${vpnnetwork} -j ACCEPT 2>/dev/null || iptables -I FORWARD -s ${vpnnetwork} -j ACCEPT
+    iptables -C FORWARD -d ${vpnnetwork} -j ACCEPT 2>/dev/null || iptables -I FORWARD -d ${vpnnetwork} -j ACCEPT
+    iptables -t nat -C POSTROUTING -s ${vpnnetwork} -o ${eth} -j MASQUERADE 2>/dev/null || \
         iptables -t nat -A POSTROUTING -s ${vpnnetwork} -o ${eth} -j MASQUERADE
-        #iptables -t nat -A POSTROUTING -j MASQUERADE
-        service iptables save
-    else
-        printf "\e[33mWARNING!!! Either firewalld or iptables is NOT Running! \e[0m\n"
-    fi    
+    # Persist rules across reboots
+    echo iptables-persistent iptables-persistent/autosave_v4 boolean true | debconf-set-selections
+    echo iptables-persistent iptables-persistent/autosave_v6 boolean true | debconf-set-selections
+    DEBIAN_FRONTEND=noninteractive apt-get install -y iptables-persistent
+    netfilter-persistent save
 }
 
 Config_System() {
-    #Disabled selinux
-    sed -i 's/SELINUX=enforcing/SELINUX=disabled/g' /etc/selinux/config
-    setenforce 0
-    #Modify the system
+    # Disable selinux only where it exists (RHEL family)
+    if [[ -f /etc/selinux/config ]]; then
+        sed -i 's/SELINUX=enforcing/SELINUX=disabled/g' /etc/selinux/config
+        setenforce 0 2>/dev/null
+    fi
     echo "Enable IP forward."
+    echo "net.ipv4.ip_forward = 1" > /etc/sysctl.d/60-ocserv.conf
     sysctl -w net.ipv4.ip_forward=1
-    echo net.ipv4.ip_forward = 1 >> "/etc/sysctl.conf"
     systemctl daemon-reload
     echo "Enable ocserv service to start during bootup."
     systemctl enable ocserv.service
@@ -247,7 +270,7 @@ GIT_PROJECT(){
 PRO_DIR() {
     echo -e "\e[0;36m"Preparation Directorys And Files..."\e[0m"
 
-    mkdir /var/www/html/ocserv_pannel/
+    mkdir -p /var/www/html/ocserv_pannel/
 
     cp -r $(pwd)/* /var/www/html/ocserv_pannel/
 }
@@ -265,21 +288,29 @@ PRO_VENV() {
 
     ./manage.py migrate
 
-    echo "from django.contrib.auth import get_user_model; User = get_user_model(); User.objects.create_superuser('admin', 'admin@myproject.com', 'admin')" | python manage.py shell
+    # Random admin password instead of admin/admin
+    panel_admin_password=$(head -c 512 /dev/urandom | tr -dc 'A-Za-z0-9' | head -c 16)
+    PANEL_ADMIN_PASSWORD="${panel_admin_password}" python manage.py shell -c "import os; from django.contrib.auth import get_user_model; U = get_user_model(); U.objects.filter(username='admin').exists() or U.objects.create_superuser('admin', 'admin@localhost', os.environ['PANEL_ADMIN_PASSWORD'])"
 
-    mkdir static
+    mkdir -p static
 
-    echo -e yes\n |./manage.py collectstatic
+    ./manage.py collectstatic --noinput
 
     chown -R www-data /var/www/html/ocserv_pannel/
 
-    echo www-data ALL = NOPASSWD: /usr/bin/ocpasswd >> /etc/sudoers
-
-    echo www-data ALL = NOPASSWD: /usr/bin/occtl >> /etc/sudoers
-    
-    echo www-data ALL = NOPASSWD: /usr/bin/systemctl restart ocserv.service >> /etc/sudoers
-    
-    echo www-data ALL = NOPASSWD: /usr/bin/systemctl status ocserv.service >> /etc/sudoers
+    # sudo rules in their own file, validated before use
+    cat > /tmp/ocserv_panel.sudoers << '_EOF_'
+www-data ALL = NOPASSWD: /usr/bin/ocpasswd
+www-data ALL = NOPASSWD: /usr/bin/occtl
+www-data ALL = NOPASSWD: /usr/bin/systemctl restart ocserv.service
+www-data ALL = NOPASSWD: /usr/bin/systemctl status ocserv.service
+_EOF_
+    if visudo -c -f /tmp/ocserv_panel.sudoers; then
+        install -m 440 /tmp/ocserv_panel.sudoers /etc/sudoers.d/ocserv_panel
+    else
+        echo -e "\e[0;31m"Invalid sudoers rules, not installed."\e[0m"
+    fi
+    rm -f /tmp/ocserv_panel.sudoers
 }
 
 PRO_SERVICES() {
@@ -323,3 +354,13 @@ INSTALL_PANNEL_Env
 PRO_DIR
 PRO_VENV
 PRO_SERVICES
+
+echo
+echo "======================================"
+echo -e "Panel URL:\t\e[34mhttp://${ipv4}/\e[0m"
+echo -e "Panel user:\t\e[34madmin\e[0m"
+echo -e "Panel pass:\t\e[34m${panel_admin_password}\e[0m"
+echo -e "VPN:\t\t\e[34m${ipv4}:${port}\e[0m  user: \e[34m${username}\e[0m"
+echo "Save the panel password now, it is not stored anywhere else."
+echo "======================================"
+

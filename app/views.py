@@ -11,12 +11,16 @@ from django.contrib.auth import update_session_auth_hash
 from django.db.models import Q
 from django.core.serializers import serialize
 
-import os, subprocess, re, json, subprocess
+import subprocess, re, json
 from ratelimit.decorators import ratelimit
 
 from.models import *
 from .forms import *
 from .decorators import *
+from . import ocpasswd
+
+ALLOWED_SERVICES = {"ocserv", "ocserv.service"}
+ALLOWED_SERVICE_MODES = {"status", "restart"}
 
 @method_decorator(ratelimit(key='ip', rate='10/d'), name='dispatch')
 @method_decorator(reCAPTCHA, name='post')
@@ -128,8 +132,7 @@ class AddUser(View):
             username = form.cleaned_data.get("oc_username")
             password = form.cleaned_data.get("oc_password")
             form.save()
-            command = f'/usr/bin/echo -e "{password}\n{password}\n"|sudo /usr/bin/ocpasswd -c /etc/ocserv/ocpasswd {username}'
-            os.system(command)
+            ocpasswd.set_password(username, password)
             context = {
                 'form' : AddUserForm,
                 'success' : username,
@@ -150,8 +153,7 @@ class DelUser(View):
         if request.is_ajax :
             user_id = (request.GET.get("user_id", None)).strip()
             obj = OcservUser.objects.get(id=user_id)
-            command = f'sudo /usr/bin/ocpasswd  -c /etc/ocserv/ocpasswd -d {obj.oc_username}'
-            os.system(command)
+            ocpasswd.delete_user(obj.oc_username)
             obj.delete()
             return JsonResponse({}, status=200)
         return JsonResponse({}, status=400)
@@ -166,12 +168,10 @@ class HandlerUser(View):
             obj = OcservUser.objects.get(id=user_id)
             if action == 'active':
                 obj.oc_active = True
-                command = f'sudo /usr/bin/ocpasswd  -c /etc/ocserv/ocpasswd -u {obj.oc_username}'
-                os.system(command)
+                ocpasswd.unlock_user(obj.oc_username)
             else:
                 obj.oc_active = False
-                command = f'sudo /usr/bin/ocpasswd  -c /etc/ocserv/ocpasswd -l {obj.oc_username}'
-                os.system(command)
+                ocpasswd.lock_user(obj.oc_username)
             obj.save()
             return JsonResponse({}, status=200)
         return JsonResponse({}, status=400)
@@ -223,9 +223,18 @@ class ServiceHandler(View):
             service = (request.GET.get("service", None)).strip() 
             if not request.user.check_password(password):
                 return JsonResponse({'error' : 'Invalid password'}, status=400)
+            if service not in ALLOWED_SERVICES or mode not in ALLOWED_SERVICE_MODES:
+                return JsonResponse({'error' : 'Invalid service or mode'}, status=400)
+
+            service = "ocserv.service"
 
             def subprocess_handler(_mode):
-                p =  subprocess.Popen(["systemctl", _mode, service, "--output=json-pretty"], stdout=subprocess.PIPE)
+                if _mode == "restart":
+                    # must match the sudoers rule exactly
+                    cmd = ["sudo", "/usr/bin/systemctl", "restart", service]
+                else:
+                    cmd = ["/usr/bin/systemctl", "status", service, "--no-pager"]
+                p =  subprocess.Popen(cmd, stdout=subprocess.PIPE)
                 (output, err) = p.communicate()
                 output = output.decode('utf-8')
                 if err:

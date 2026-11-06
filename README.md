@@ -9,7 +9,15 @@ Ocserv and Ocserv User Management Pannel
 login user pannel params : 
 
     # username : admin
-    # password : admin
+    # password : random, printed at the end of install.sh (save it!)
+    # to change it later:
+    #   cd /var/www/html/ocserv_pannel && venv/bin/python manage.py changepassword admin
+
+secret key:
+
+    # a random Django SECRET_KEY is generated on first start in
+    # /var/www/html/ocserv_pannel/.secret_key (or set OCSERV_PANEL_SECRET_KEY)
+    # restrict panel hosts with OCSERV_PANEL_ALLOWED_HOSTS=vpn.example.com
     
 
 use google reCAPTCHA for login page:

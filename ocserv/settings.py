@@ -1,12 +1,37 @@
+import os
 from pathlib import Path
+
+from django.core.management.utils import get_random_secret_key
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-SECRET_KEY = 'django-insecure-kilxsn6108h8e1yn2%td%oypy#y^hgi7+-bgnurw)rsd*-m_%9'
 
-DEBUG = False
+def _load_secret_key():
+    """Read SECRET_KEY from the environment or a local, untracked file.
 
-ALLOWED_HOSTS = ["*"]
+    The file is created with a random key on first start, so every
+    installation gets its own key instead of the one published in git.
+    """
+    key = os.environ.get("OCSERV_PANEL_SECRET_KEY")
+    if key:
+        return key
+    key_file = BASE_DIR / ".secret_key"
+    if key_file.exists():
+        return key_file.read_text().strip()
+    key = get_random_secret_key()
+    key_file.write_text(key)
+    os.chmod(key_file, 0o600)
+    return key
+
+
+SECRET_KEY = _load_secret_key()
+
+DEBUG = os.environ.get("OCSERV_PANEL_DEBUG", "") == "1"
+
+ALLOWED_HOSTS = [h.strip() for h in os.environ.get("OCSERV_PANEL_ALLOWED_HOSTS", "*").split(",") if h.strip()]
+
+SESSION_COOKIE_HTTPONLY = True
+X_FRAME_OPTIONS = "DENY"
 
 INSTALLED_APPS = [
     'django.contrib.admin',

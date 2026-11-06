@@ -11,3 +11,7 @@ media/
 TODO.txt
 .vscode
 old/
+.secret_key
+static/
+*.pem
+*.tmpl
